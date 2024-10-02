@@ -1,0 +1,259 @@
+import com.github.javafaker.Faker;
+
+import java.sql.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class DynamicDummyDataGenerator {
+
+    private final Connection connection;
+    private final Faker faker = new Faker();
+
+    public DynamicDummyDataGenerator(Connection connection) {
+        this.connection = connection;
+    }
+
+    public static void main(String[] args) {
+        String jdbcUrl = "jdbc:mysql://localhost:3306/your_db_name?useSSL=false&serverTimezone=UTC";
+        String username = "your_username";
+        String password = "your_password";
+
+        try (Connection connection = DriverManager.getConnection(jdbcUrl, username, password)) {
+            DynamicDummyDataGenerator generator = new DynamicDummyDataGenerator(connection);
+            generator.generateDummyDataForAllTables();
+            System.out.println("Dummy data generation completed.");
+        } catch (SQLException e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Main method to generate dummy data for all tables
+    public void generateDummyDataForAllTables() throws SQLException {
+        List<String> tables = getTables();
+        for (String table : tables) {
+            insertDummyDataForTable(table);
+        }
+    }
+
+    // Fetch all table names dynamically
+    private List<String> getTables() throws SQLException {
+        String sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'your_db_name'";
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            List<String> tables = new ArrayList<>();
+            while (rs.next()) {
+                tables.add(rs.getString("table_name"));
+            }
+            return tables;
+        }
+    }
+
+    // Fetch columns and metadata for a specific table
+    private List<ColumnMetaData> getTableColumns(String tableName) throws SQLException {
+        String sql = "SELECT column_name, data_type, column_key, extra, is_nullable, column_default " +
+                "FROM information_schema.columns WHERE table_schema = 'your_db_name' AND table_name = ?";
+        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            pstmt.setString(1, tableName);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                List<ColumnMetaData> columns = new ArrayList<>();
+                while (rs.next()) {
+                    columns.add(new ColumnMetaData(
+                            rs.getString("column_name"),
+                            rs.getString("data_type"),
+                            rs.getString("column_key"),
+                            rs.getString("extra"),
+                            rs.getString("is_nullable"),
+                            rs.getString("column_default")));
+                }
+                return columns;
+            }
+        }
+    }
+
+    // Fetch foreign key constraints for a specific table
+    private Map<String, ForeignKeyMetaData> getForeignKeys(String tableName) throws SQLException {
+        String sql = "SELECT column_name, referenced_table_name, referenced_column_name " +
+                "FROM information_schema.key_column_usage " +
+                "WHERE table_schema = 'your_db_name' AND table_name = ? AND referenced_table_name IS NOT NULL";
+        try (PreparedStatement pstmt = connection.prepareStatement(sql)) {
+            pstmt.setString(1, tableName);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                Map<String, ForeignKeyMetaData> foreignKeys = new HashMap<>();
+                while (rs.next()) {
+                    foreignKeys.put(rs.getString("column_name"),
+                            new ForeignKeyMetaData(rs.getString("referenced_table_name"), rs.getString("referenced_column_name")));
+                }
+                return foreignKeys;
+            }
+        }
+    }
+
+    // Insert dummy data dynamically for a specific table
+    private void insertDummyDataForTable(String tableName) throws SQLException {
+        List<ColumnMetaData> columns = getTableColumns(tableName);
+        Map<String, ForeignKeyMetaData> foreignKeys = getForeignKeys(tableName);
+
+        int batchSize = 1000;  // Adjust batch size if needed
+        List<String> batchInsertQueries = new ArrayList<>();
+
+        for (int i = 0; i < 1000000; i++) {
+            String insertQuery = generateInsertQuery(tableName, columns, foreignKeys);
+            batchInsertQueries.add(insertQuery);
+
+            if (i % batchSize == 0 && i > 0) {
+                executeBatch(batchInsertQueries);
+                batchInsertQueries.clear();
+            }
+        }
+
+        // Insert any remaining data
+        if (!batchInsertQueries.isEmpty()) {
+            executeBatch(batchInsertQueries);
+        }
+    }
+
+    // Generate an SQL insert statement dynamically based on column types
+    private String generateInsertQuery(String tableName, List<ColumnMetaData> columns, Map<String, ForeignKeyMetaData> foreignKeys) throws SQLException {
+        String columnNames = columns.stream()
+                .map(ColumnMetaData::getColumnName)
+                .collect(Collectors.joining(", "));
+
+        String values = columns.stream()
+                .map(column -> generateDummyValue(column, foreignKeys))
+                .collect(Collectors.joining(", "));
+
+        return String.format("INSERT INTO %s (%s) VALUES (%s);", tableName, columnNames, values);
+    }
+
+    // Generate a dummy value based on column data type and foreign key constraints
+    private String generateDummyValue(ColumnMetaData column, Map<String, ForeignKeyMetaData> foreignKeys) throws SQLException {
+        // Handle foreign key constraints by fetching a random value from the referenced table
+        if (foreignKeys.containsKey(column.getColumnName())) {
+            return getRandomForeignKeyValue(foreignKeys.get(column.getColumnName()));
+        }
+
+        // Handle primary key uniqueness (if not auto-increment)
+        if ("PRI".equals(column.getColumnKey()) && !"auto_increment".equals(column.getExtra())) {
+            return String.valueOf(faker.number().randomNumber());
+        }
+
+        // Handle various data types
+        switch (column.getDataType()) {
+            case "varchar":
+            case "text":
+                return "'" + faker.lorem().word() + "'";
+            case "int":
+            case "bigint":
+                return String.valueOf(faker.number().numberBetween(1, 1000000));
+            case "date":
+                return "'" + new Date(faker.date().birthday().getTime()) + "'";
+            case "boolean":
+                return String.valueOf(faker.bool().bool());
+            case "double":
+            case "float":
+                return String.valueOf(faker.number().randomDouble(2, 1, 1000));
+            default:
+                return "'" + faker.lorem().word() + "'";
+        }
+    }
+
+    // Fetch a random value from a foreign key referenced table
+    private String getRandomForeignKeyValue(ForeignKeyMetaData foreignKey) throws SQLException {
+        String sql = "SELECT " + foreignKey.getReferencedColumnName() + " FROM " + foreignKey.getReferencedTableName() + " ORDER BY RAND() LIMIT 1";
+        try (Statement stmt = connection.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+            if (rs.next()) {
+                return "'" + rs.getString(1) + "'";  // Assuming the first column is the primary key
+            }
+        }
+        return "NULL";  // If no records are found
+    }
+
+    // Execute batch insert queries
+    private void executeBatch(List<String> batchInsertQueries) throws SQLException {
+        try (Statement stmt = connection.createStatement()) {
+            for (String query : batchInsertQueries) {
+                stmt.addBatch(query);
+            }
+            stmt.executeBatch();
+        }
+    }
+
+    // Inner class to hold metadata about a column
+    private static class ColumnMetaData {
+        private final String columnName;
+        private final String dataType;
+        private final String columnKey;
+        private final String extra;
+        private final String isNullable;
+        private final String columnDefault;
+
+        public ColumnMetaData(String columnName, String dataType, String columnKey, String extra, String isNullable, String columnDefault) {
+            this.columnName = columnName;
+            this.dataType = dataType;
+            this.columnKey = columnKey;
+            this.extra = extra;
+            this.isNullable = isNullable;
+            this.columnDefault = columnDefault;
+        }
+
+        public String getColumnName() {
+            return columnName;
+        }
+
+        public String getDataType() {
+            return dataType;
+        }
+
+        public String getColumnKey() {
+            return columnKey;
+        }
+
+        public String getExtra() {
+            return extra;
+        }
+
+        public String getIsNullable() {
+            return isNullable;
+        }
+
+        public String getColumnDefault() {
+            return columnDefault;
+        }
+    }
+
+    private static class ForeignKeyMetaData {
+        private final String referencedTableName;
+        private final String referencedColumnName;
+
+        public ForeignKeyMetaData(String referencedTableName, String referencedColumnName) {
+            this.referencedTableName = referencedTableName;
+            this.referencedColumnName = referencedColumnName;
+        }
+
+        public String getReferencedTableName() {
+            return referencedTableName;
+        }
+
+        public String getReferencedColumnName() {
+            return referencedColumnName;
+        }
+    }
+}
+
+
+
+dependencies {
+    // MSSQL Driver for Database Connectivity
+    implementation 'com.microsoft.sqlserver:mssql-jdbc:12.2.0.jre11'
+
+    // Java Faker for generating dummy data
+    implementation 'com.github.javafaker:javafaker:1.0.2'
+
+    // Optional: SLF4J for logging if needed
+    implementation 'org.slf4j:slf4j-api:1.7.36'
+    
+    // Optional: SLF4J Simple for basic logging output to the console
+    implementation 'org.slf4j:slf4j-simple:1.7.36'
+}
+
