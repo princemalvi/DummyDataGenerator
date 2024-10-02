@@ -1,0 +1,239 @@
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class DynamicDummyDataGeneratorController {
+
+    private final DynamicDummyDataGeneratorService dummyDataGeneratorService;
+
+    public DynamicDummyDataGeneratorController(DynamicDummyDataGeneratorService dummyDataGeneratorService) {
+        this.dummyDataGeneratorService = dummyDataGeneratorService;
+    }
+
+    // Endpoint to trigger dummy data generation
+    @GetMapping("/generate-dummy-data")
+    public String generateDummyData() {
+        dummyDataGeneratorService.generateDummyData();
+        return "Dummy data generation initiated.";
+    }
+}
+
+
+
+import com.github.javafaker.Faker;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import javax.sql.DataSource;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@Service
+public class DynamicDummyDataGeneratorService {
+
+    private final JdbcTemplate jdbcTemplate;
+    private final Faker faker = new Faker();
+
+    public DynamicDummyDataGeneratorService(DataSource dataSource) {
+        this.jdbcTemplate = new JdbcTemplate(dataSource);
+    }
+
+    // Main method to generate dummy data for all tables
+    public void generateDummyData() {
+        List<String> tables = getTables();
+        for (String table : tables) {
+            insertDummyDataForTable(table);
+        }
+    }
+
+    // Fetch all table names dynamically
+    private List<String> getTables() {
+        String sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'your_db'";
+        return jdbcTemplate.queryForList(sql, String.class);
+    }
+
+    // Fetch columns and data types for a specific table
+    private List<ColumnMetaData> getTableColumns(String tableName) {
+        String sql = "SELECT column_name, data_type FROM information_schema.columns " +
+                     "WHERE table_schema = 'your_db' AND table_name = ?";
+        return jdbcTemplate.query(sql, new Object[]{tableName}, this::mapColumnMetaData);
+    }
+
+    // Fetch check constraints for a specific table
+    private List<CheckConstraint> getTableCheckConstraints(String tableName) {
+        String sql = "SELECT COLUMN_NAME, CHECK_CLAUSE FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS " +
+                     "WHERE CONSTRAINT_SCHEMA = 'your_db' AND TABLE_NAME = ?";
+        return jdbcTemplate.query(sql, new Object[]{tableName}, this::mapCheckConstraint);
+    }
+
+    // Map column metadata from ResultSet
+    private ColumnMetaData mapColumnMetaData(ResultSet rs, int rowNum) throws SQLException {
+        return new ColumnMetaData(rs.getString("column_name"), rs.getString("data_type"));
+    }
+
+    // Map check constraint data from ResultSet
+    private CheckConstraint mapCheckConstraint(ResultSet rs, int rowNum) throws SQLException {
+        return new CheckConstraint(rs.getString("column_name"), rs.getString("check_clause"));
+    }
+
+    // Insert dummy data dynamically for a specific table
+    private void insertDummyDataForTable(String tableName) {
+        List<ColumnMetaData> columns = getTableColumns(tableName);
+        List<CheckConstraint> checkConstraints = getTableCheckConstraints(tableName);
+
+        int batchSize = 1000;  // Adjust batch size if needed
+        List<Object[]> batchData = new ArrayList<>();
+        
+        // Generate data for each column based on its type and check constraints
+        for (int i = 0; i < 1000000; i++) {
+            List<Object> rowData = columns.stream()
+                .map(col -> generateDummyValue(col, checkConstraints))  // Generate dummy value based on column type and constraints
+                .collect(Collectors.toList());
+            batchData.add(rowData.toArray());
+
+            if (i % batchSize == 0 && i > 0) {
+                insertBatchData(tableName, columns, batchData);
+                batchData.clear();
+            }
+        }
+
+        // Insert any remaining data
+        if (!batchData.isEmpty()) {
+            insertBatchData(tableName, columns, batchData);
+        }
+    }
+
+    // Generate a dummy value based on column data type and check constraints
+    private Object generateDummyValue(ColumnMetaData column, List<CheckConstraint> checkConstraints) {
+        // Check if the column has a check constraint
+        CheckConstraint constraint = checkConstraints.stream()
+            .filter(c -> c.getColumnName().equals(column.getColumnName()))
+            .findFirst()
+            .orElse(null);
+
+        if (constraint != null) {
+            String checkClause = constraint.getCheckClause();
+
+            // Handle numeric range constraints
+            if (checkClause.contains(">=") && checkClause.contains("<=")) {
+                int minValue = extractMinValue(checkClause);
+                int maxValue = extractMaxValue(checkClause);
+                return faker.number().numberBetween(minValue, maxValue);
+            }
+
+            // Handle string-based 'IN' constraints
+            if (checkClause.contains("IN")) {
+                List<String> allowedValues = extractInConstraintValues(checkClause);
+                return faker.options().option(allowedValues.toArray());
+            }
+
+            // Handle string length constraints (e.g., LENGTH(column) <= 10)
+            if (checkClause.contains("LENGTH(") || checkClause.contains("CHAR_LENGTH(")) {
+                int maxLength = extractMaxLengthConstraint(checkClause);
+                return faker.lorem().characters(1, maxLength);  // Generate string with specified max length
+            }
+
+            // Handle LIKE pattern constraints (e.g., column LIKE 'A%')
+            if (checkClause.contains("LIKE")) {
+                String likePattern = extractLikePattern(checkClause);
+                return generateStringMatchingPattern(likePattern);
+            }
+        }
+
+        // Fallback to default dummy generation if no check constraint
+        switch (column.getDataType()) {
+            case "varchar":
+            case "text":
+                return faker.lorem().word();
+            case "int":
+            case "bigint":
+                return faker.number().randomNumber();
+            case "date":
+                return faker.date().birthday();  // Use Faker to generate dates
+            case "boolean":
+                return faker.bool().bool();
+            case "double":
+            case "float":
+                return faker.number().randomDouble(2, 1, 1000);
+            default:
+                return faker.lorem().word();  // Default to string for unknown types
+        }
+    }
+
+    // Extract minimum value from check clause
+    private int extractMinValue(String checkClause) {
+        String[] parts = checkClause.split("AND");
+        String minPart = parts[0].trim();
+        return Integer.parseInt(minPart.substring(minPart.indexOf(">=") + 2).trim());
+    }
+
+    // Extract maximum value from check clause
+    private int extractMaxValue(String checkClause) {
+        String[] parts = checkClause.split("AND");
+        String maxPart = parts[1].trim();
+        return Integer.parseInt(maxPart.substring(maxPart.indexOf("<=") + 2).trim());
+    }
+
+    // Extract allowed values for 'IN' check constraint
+    private List<String> extractInConstraintValues(String checkClause) {
+        String inClause = checkClause.substring(checkClause.indexOf("IN") + 2).trim();
+        inClause = inClause.replaceAll("[()']", "");  // Remove parentheses and quotes
+        return List.of(inClause.split(",")).stream().map(String::trim).collect(Collectors.toList());
+    }
+
+    // Extract max length for 'LENGTH(column)' check constraint
+    private int extractMaxLengthConstraint(String checkClause) {
+        String lengthPart = checkClause.substring(checkClause.indexOf("<=") + 2).trim();
+        return Integer.parseInt(lengthPart);
+    }
+
+    // Extract LIKE pattern from check constraint
+    private String extractLikePattern(String checkClause) {
+        String likePart = checkClause.substring(checkClause.indexOf("LIKE") + 4).trim();
+        return likePart.replaceAll("[']", "");  // Remove quotes
+    }
+
+    // Generate a string that matches a LIKE pattern (e.g., 'A%')
+    private String generateStringMatchingPattern(String pattern) {
+        if (pattern.endsWith("%")) {
+            String prefix = pattern.substring(0, pattern.length() - 1);
+            return prefix + faker.lorem().characters(5);  // Append random characters
+        } else if (pattern.startsWith("%")) {
+            String suffix = pattern.substring(1);
+            return faker.lorem().characters(5) + suffix;  // Prepend random characters
+        } else {
+            return pattern;  // Exact match
+        }
+    }
+
+<dependency>
+    <groupId>com.github.javafaker</groupId>
+    <artifactId>javafaker</artifactId>
+    <version>1.0.2</version> <!-- Check for the latest version -->
+</dependency>
+
+<dependency>
+    <groupId>mysql</groupId>
+    <artifactId>mysql-connector-java</artifactId>
+    <version>8.0.33</version> <!-- Check for the latest version -->
+</dependency>
+
+
+# Database configuration
+spring.datasource.url=jdbc:mysql://localhost:3306/your_db_name?useSSL=false&serverTimezone=UTC
+spring.datasource.username=your_username
+spring.datasource.password=your_password
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+
+# Hibernate properties
+spring.jpa.hibernate.ddl-auto=update  # or 'create' for initial creation
+spring.jpa.show-sql=true
+spring.jpa.properties.hibernate.format_sql=true
+spring.jpa.properties.hibernate.jdbc.time_zone=UTC
+
+# Additional configurations
+spring.datasource.initialization-mode=always  # To initialize the DB on startup
